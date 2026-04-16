@@ -21,28 +21,92 @@ Note: please modify the version of some packages for your own environment.
 
 ## Quick Start
 
-Download the models from [Huggingface](https://huggingface.co/), then the you can run the code run_cmoe.py. Set model path as 'MODEL_PATH'.
+The included pipeline measures **GPU energy** (via NVML) and **PPL** for the
+**dense** model and the **carved MoE** model, so you can directly compare
+"before vs after" in [Weights & Biases](https://wandb.ai/).
 
-You can run the pre-defined testing script 'run.sh' by:
+### 1. Install + log in to W&B
+
 ```bash
+pip install -r requirements.txt
+wandb login
+```
+
+### 2. Download the Hugging Face model (one-time)
+
+```bash
+# Linux / macOS / Git Bash
+bash run.sh download
+
+# Windows PowerShell
+.\run.ps1 download
+```
+
+This calls `download_model.py`, which fetches a snapshot via `huggingface_hub`.
+Set `MODEL=...` to choose a different repo, and pass `--token hf_xxx` for
+gated repos (or set `HF_TOKEN` in your env). The printed local path can be
+re-used as `MODEL_PATH` if you prefer to keep the weights in a fixed folder.
+
+### 3. Run the full energy comparison pipeline
+
+```bash
+# Linux / macOS / Git Bash
+bash run.sh
+
+# Windows PowerShell
+.\run.ps1
+```
+
+The pipeline runs five W&B-logged phases in a single process:
+
+| Phase | W&B `phase_name`         | What it measures                                     |
+|-------|--------------------------|------------------------------------------------------|
+| 0     | `dense_baseline_eval`    | PPL + GPU Joules of the **original dense** model     |
+| 1     | `conversion`             | GPU Joules to **carve** the MoE                      |
+| 2     | `post_conversion_eval`   | PPL + Joules of the **MoE before fine-tune**         |
+| 3     | `finetune`               | GPU Joules during LoRA fine-tune                     |
+| 4     | `post_finetune_eval`     | PPL + Joules of the **MoE after fine-tune**          |
+
+In W&B look for:
+
+- `phase/<name>_joules` summaries (one per phase)
+- `ppl/dense_baseline_*`, `ppl/post_conversion_*`, `ppl/finetuned_*`
+- `energy/gpu_power_w` and `energy/total_energy_j` time-series
+
+PPL numbers are also written to `result_logs/<model>_<dataset>_*.txt`
+(`dense_ppl`, `pre_ppl`, `ft_ppl`).
+
+### 4. Customize
+
+All knobs are environment variables in the launcher scripts:
+
+```bash
+MODEL=meta-llama/Meta-Llama-3-8B \
+DATASET=wikitext2 \
+NSHARED=2 NACTIVATED=2 NEXPERTS=16 \
+NSAMPLES=2048 EPOCH=1 \
 bash run.sh
 ```
 
-Or resetting the hyperparameters to run customized setting.
-For example, run S2A2E16 with 2,048 fine-tuning data on wikitext2:
-```python
-python run_cmoe.py $MODEL_PATH wikitext2 \ 
---nshared 2 \
---nactivated 2 \
---nexperts 16 \
---nsamples 2048 \
---extra-lr 0.001 --bias-speed 0.001 --new-eval
+To skip the dense baseline (e.g. if you've already measured it):
+
+```bash
+bash run.sh -- --skip-dense-baseline
+```
+
+You can still call `run_cmoe.py` directly:
+
+```bash
+python run_cmoe.py $MODEL_PATH wikitext2 \
+    --nshared 2 --nactivated 2 --nexperts 16 \
+    --nsamples 2048 --extra-lr 0.001 --bias-speed 0.001 --new-eval
 ```
 
 ## Evaluation
 
-Our code automatically run ppl eval.
-If you want to do evaluation on downstream tasks, you can add the arg `--eval-zero`, where the code is implemented by [Wanda](https://github.com/locuslab/wanda).
+PPL eval runs automatically (in phases 0, 2, and 4 above).
+For downstream tasks, add `--eval-zero` (implemented via
+[Wanda](https://github.com/locuslab/wanda)).
 
 ## Cite
 

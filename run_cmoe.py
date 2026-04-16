@@ -46,7 +46,15 @@ def get_llava(model):
     return model
 
 
-def cmoe_sequential(model, dataloader, dev, args):
+def _restore_full_gpu_placement(model):
+    """`cmoe_ppl_eval` offloads layers to CPU. Put everything back on the GPU
+    so the carving / fine-tuning stages can run."""
+    model.cuda()
+    model.model.layers.cuda()
+    torch.cuda.empty_cache()
+
+
+def cmoe_sequential(model, dataloader, dev, args, tracker=None):
     print('Starting ...')
 
     use_cache = model.config.use_cache
@@ -96,8 +104,35 @@ def cmoe_sequential(model, dataloader, dev, args):
 
     inp = copy.deepcopy(inps[0])
 
+    if tracker is None:
+        tracker = EnergyTracker(gpu_index=0)
+        owns_tracker = True
+    else:
+        owns_tracker = False
+
+    # ── PHASE 0: Dense baseline PPL + energy ──────────────────────
+    # Runs the SAME eval code path that we use after carving, so the
+    # before/after numbers are directly comparable.
+    dense_ppl = []
+    if not getattr(args, 'skip_dense_baseline', False):
+        print('Dense baseline PPL (pre-conversion):')
+        tracker.start()
+        eval_datasets = ['wikitext2', 'c4-new']
+        for dataset in eval_datasets:
+            _, testloader = get_loaders(
+                dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
+            )
+            print(dataset)
+            ppl_i = cmoe_ppl_eval(model, testloader, DEV, dataset, args)
+            dense_ppl.append(f"{dataset}: {ppl_i}")
+            wandb.log({f"ppl/dense_baseline_{dataset}": ppl_i})
+        tracker.stop(phase_name="dense_baseline_eval")
+        # cmoe_ppl_eval offloaded layers to CPU; put them back for carving.
+        _restore_full_gpu_placement(model)
+        layers = model.model.layers
+    # ──────────────────────────────────────────────────────────────
+
     # ── PHASE 1: MoE Carving ───────────────────────────────────────
-    tracker = EnergyTracker(gpu_index=0)
     tracker.start()
 
     carve_inp = copy.deepcopy(inp)
@@ -118,10 +153,10 @@ def cmoe_sequential(model, dataloader, dev, args):
 
     tick_1 = time.time()
 
-    # ── PHASE 2: Training-free PPL eval ───────────────────────────
+    # ── PHASE 2: Post-conversion (training-free) PPL eval ─────────
     tracker.start()
 
-    print('Training_free_ppl:')
+    print('Post-conversion (training-free) PPL:')
     pre_ppl = []
     datasets = ['wikitext2', 'c4-new']
     for dataset in datasets:
@@ -132,9 +167,12 @@ def cmoe_sequential(model, dataloader, dev, args):
         eval_set = dataset
         ppl_i = cmoe_ppl_eval(model, testloader, DEV, eval_set, args)
         pre_ppl.append(f"{dataset}: {ppl_i}")
-        wandb.log({f"ppl/training_free_{dataset}": ppl_i})
+        wandb.log({
+            f"ppl/post_conversion_{dataset}": ppl_i,
+            f"ppl/training_free_{dataset}": ppl_i,
+        })
 
-    tracker.stop(phase_name="training_free_eval")
+    tracker.stop(phase_name="post_conversion_eval")
     # ──────────────────────────────────────────────────────────────
     
     tick_2 = time.time()
@@ -154,12 +192,13 @@ def cmoe_sequential(model, dataloader, dev, args):
     tracker.stop(phase_name="finetune")
     # ──────────────────────────────────────────────────────────────
 
-    tracker.shutdown()
+    if owns_tracker:
+        tracker.shutdown()
 
     model.eval()
     model.config.use_cache = use_cache
-    
-    return model, tick_1, tick_2, pre_ppl
+
+    return model, tick_1, tick_2, pre_ppl, dense_ppl, tracker
 
 @torch.no_grad()
 def cmoe_ppl_eval(model, testenc, dev, eval_set, args):
@@ -328,13 +367,31 @@ if __name__ == '__main__':
         '--prefix', type=str, default=None,
         help='Prefix the results folder if needed.'
     )
+    parser.add_argument(
+        '--skip-dense-baseline', action='store_true',
+        help='Skip the dense (pre-conversion) PPL + energy baseline.'
+    )
+    parser.add_argument(
+        '--wandb-project', type=str, default='cmoe-energy',
+        help='W&B project name for the energy comparison run.'
+    )
+    parser.add_argument(
+        '--wandb-run-name', type=str, default=None,
+        help='Optional W&B run name. Defaults to a descriptive auto name.'
+    )
 
     args = parser.parse_args()
 
+    model_short = args.model.split('/')[-1] if args.model else 'model'
+    default_run_name = (
+        f"{model_short}_{args.dataset}_S{args.nshared}A{args.nactivated}"
+        f"E{args.nexperts}_n{args.nsamples}"
+    )
+
     # ── INIT WANDB ────────────────────────────────────────────────
     wandb.init(
-        project="cmoe-energy",
-        name=f"S{args.nshared}A{args.nactivated}E{args.nexperts}_n{args.nsamples}",
+        project=args.wandb_project,
+        name=args.wandb_run_name or default_run_name,
         config={
             "model": args.model,
             "dataset": args.dataset,
@@ -345,6 +402,7 @@ if __name__ == '__main__':
             "epoch": args.epoch,
             "extra_lr": args.extra_lr,
             "bias_speed": args.bias_speed,
+            "skip_dense_baseline": args.skip_dense_baseline,
         }
     )
     # ─────────────────────────────────────────────────────────────
@@ -363,8 +421,12 @@ if __name__ == '__main__':
     print("model: ", args.model)
     print("cali_data: ", args.dataset)
 
+    tracker = EnergyTracker(gpu_index=0)
+
     tick = time.time()
-    carved_model, tick_1, tick_2, pre_ppl = cmoe_sequential(model, dataloader, DEV, args)
+    carved_model, tick_1, tick_2, pre_ppl, dense_ppl, tracker = cmoe_sequential(
+        model, dataloader, DEV, args, tracker=tracker
+    )
     rt_construct = tick_1 - tick
     extra_time = tick_2 - tick_1
     rt = time.time() - tick - extra_time
@@ -379,6 +441,9 @@ if __name__ == '__main__':
     else:
         name = "meta-llama/Llama-2-7b-hf"
 
+    # ── PHASE 4: Post-finetune MoE baseline (energy + PPL) ─────────
+    tracker.start()
+
     datasets = ['wikitext2', 'c4-new']
     ppl = []
     for dataset in datasets:
@@ -390,6 +455,9 @@ if __name__ == '__main__':
         ppl_i = cmoe_ppl_eval(carved_model, testloader, DEV, eval_set, args)
         ppl.append(f"{dataset}: {ppl_i}")
 
+    tracker.stop(phase_name="post_finetune_eval")
+    # ──────────────────────────────────────────────────────────────
+
     model_name = args.model.split("/")[-1]
     file_name = f"{model_name}_{args.dataset}_{args.nsamples}_epoch_{args.epoch}_S{args.nshared}_A{args.nactivated}_E{args.nexperts}.txt"
     dir_path = os.path.join('./result_logs', args.prefix) if args.prefix is not None else './result_logs'
@@ -397,6 +465,7 @@ if __name__ == '__main__':
         os.makedirs(dir_path)
     file_name = os.path.join(dir_path, file_name)
 
+    save_results(file_name, f"dense_ppl: {str(dense_ppl)}")
     save_results(file_name, f"pre_ppl: {str(pre_ppl)}")
     save_results(file_name, f"ft_ppl: {str(ppl)}")
     save_results(file_name, f"runtime_construct: {rt_construct}")
@@ -411,6 +480,8 @@ if __name__ == '__main__':
         "runtime/construction_sec": rt_construct,
         "runtime/total_sec": rt,
     })
+
+    tracker.shutdown()
     wandb.finish()
     # ──────────────────────────────────────────────────────────────
 
