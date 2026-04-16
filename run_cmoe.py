@@ -14,8 +14,12 @@ from CMoE_model import *
 from zero_eval import *
 from sft_utils import simple_sft
 
-DEV = torch.device('cuda:0')
+# ── WANDB ENERGY TRACKING ──────────────────────────────────────────
+import wandb
+from energy_tracker import EnergyTracker
+# ───────────────────────────────────────────────────────────────────
 
+DEV = torch.device('cuda:0')
 def get_llama(model):
     import torch
     def skip(*args, **kwargs):
@@ -62,7 +66,6 @@ def cmoe_sequential(model, dataloader, dev, args):
             super().__init__()
             self.module = module
         def forward(self, inp, **kwargs):
-
             inps[cache['i']] = inp
             cache['i'] += 1
             cache['attention_mask'] = kwargs['attention_mask']
@@ -93,7 +96,10 @@ def cmoe_sequential(model, dataloader, dev, args):
 
     inp = copy.deepcopy(inps[0])
 
-    # MoE Carving
+    # ── PHASE 1: MoE Carving ───────────────────────────────────────
+    tracker = EnergyTracker(gpu_index=0)
+    tracker.start()
+
     carve_inp = copy.deepcopy(inp)
     for layer in tqdm(layers, desc = 'Carving MoE layers...'):
         moe_out = construct_moe(layer, 
@@ -107,8 +113,13 @@ def cmoe_sequential(model, dataloader, dev, args):
         )
         carve_inp = moe_out
 
-    
+    tracker.stop(phase_name="conversion")
+    # ──────────────────────────────────────────────────────────────
+
     tick_1 = time.time()
+
+    # ── PHASE 2: Training-free PPL eval ───────────────────────────
+    tracker.start()
 
     print('Training_free_ppl:')
     pre_ppl = []
@@ -121,13 +132,18 @@ def cmoe_sequential(model, dataloader, dev, args):
         eval_set = dataset
         ppl_i = cmoe_ppl_eval(model, testloader, DEV, eval_set, args)
         pre_ppl.append(f"{dataset}: {ppl_i}")
+        wandb.log({f"ppl/training_free_{dataset}": ppl_i})
+
+    tracker.stop(phase_name="training_free_eval")
+    # ──────────────────────────────────────────────────────────────
     
     tick_2 = time.time()
-    
 
-    # LoRa-based Supervised Fine-tuning
+    # ── PHASE 3: LoRA Fine-tuning ──────────────────────────────────
+    tracker.start()
+
     for layer in layers:
-            layer.mlp.cus_training = True
+        layer.mlp.cus_training = True
 
     model.cuda()
     model = simple_sft(model, args, epoch = args.epoch)
@@ -135,8 +151,12 @@ def cmoe_sequential(model, dataloader, dev, args):
     for layer in layers:
         layer.mlp.cus_training = False
 
-    model.eval()
+    tracker.stop(phase_name="finetune")
+    # ──────────────────────────────────────────────────────────────
 
+    tracker.shutdown()
+
+    model.eval()
     model.config.use_cache = use_cache
     
     return model, tick_1, tick_2, pre_ppl
@@ -311,6 +331,24 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
+    # ── INIT WANDB ────────────────────────────────────────────────
+    wandb.init(
+        project="cmoe-energy",
+        name=f"S{args.nshared}A{args.nactivated}E{args.nexperts}_n{args.nsamples}",
+        config={
+            "model": args.model,
+            "dataset": args.dataset,
+            "nshared": args.nshared,
+            "nactivated": args.nactivated,
+            "nexperts": args.nexperts,
+            "nsamples": args.nsamples,
+            "epoch": args.epoch,
+            "extra_lr": args.extra_lr,
+            "bias_speed": args.bias_speed,
+        }
+    )
+    # ─────────────────────────────────────────────────────────────
+
     if 'llava' in args.model.lower():
         model = get_llava(args.model)
     else:
@@ -363,6 +401,18 @@ if __name__ == '__main__':
     save_results(file_name, f"ft_ppl: {str(ppl)}")
     save_results(file_name, f"runtime_construct: {rt_construct}")
     save_results(file_name, f"runtime_all: {rt}")
+
+    # ── LOG FINAL RESULTS TO WANDB ─────────────────────────────────
+    for entry in ppl:
+        dataset_name, ppl_val = entry.split(": ")
+        wandb.log({f"ppl/finetuned_{dataset_name.strip()}": float(ppl_val)})
+
+    wandb.log({
+        "runtime/construction_sec": rt_construct,
+        "runtime/total_sec": rt,
+    })
+    wandb.finish()
+    # ──────────────────────────────────────────────────────────────
 
     if args.eval_zero:
         task_list = ["winogrande"]
