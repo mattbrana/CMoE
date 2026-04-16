@@ -1,0 +1,12 @@
+cat > requirements.txt << EOF
+datasets==2.21.0
+transformers==4.47.1
+accelerate==1.2.1
+sentencepiece==0.2.0
+protobuf==5.29.2
+matplotlib==3.10.0
+lap==0.5.12
+peft==0.14.0
+wandb
+pynvml
+EOF
